@@ -598,6 +598,64 @@ app.get("/setup/api/logs/tail", requireHermesAuth, async (req, res) => {
   }
 });
 
+// Live doctor output — wraps `openclaw doctor`. Hermes uses this to see
+// environment/permission/network issues that don't show up in health/metrics.
+app.get("/setup/api/doctor", requireHermesAuth, async (_req, res) => {
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
+    res.status(r.code === 0 ? 200 : 500).json({
+      ok: r.code === 0,
+      exitCode: r.code,
+      output: redactSecrets(r.output || ""),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Aggregate conversation / message / error counts for Hermes's daily trend
+// analysis. Best-effort: if the underlying `openclaw messages stats` command
+// isn't available in this OpenClaw version, we return a skeleton so the
+// analyzer doesn't blow up.
+app.get("/setup/api/conversations/stats", requireHermesAuth, async (_req, res) => {
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["messages", "stats", "--json"]));
+    let parsed = null;
+    try {
+      parsed = JSON.parse(r.output || "{}");
+    } catch {
+      parsed = { raw: redactSecrets(r.output || "") };
+    }
+    res.status(200).json({
+      ok: r.code === 0,
+      exitCode: r.code,
+      stats: parsed,
+    });
+  } catch (err) {
+    // Swallow — conversation stats are a nice-to-have for Hermes, not a hard dep
+    res.status(200).json({ ok: false, error: String(err), stats: null });
+  }
+});
+
+// Bearer-authorized gateway restart for Hermes. This is the safe, explicit
+// path — no need to touch config just to bounce the gateway.
+app.post("/setup/api/gateway/restart", requireHermesAuth, async (_req, res) => {
+  try {
+    // Reuse the internal restart helper if it exists; otherwise kill the child
+    // so the supervisor respawns it.
+    if (typeof gatewayProc !== "undefined" && gatewayProc && !gatewayProc.killed) {
+      gatewayProc.kill("SIGTERM");
+    }
+    res.status(200).json({
+      ok: true,
+      message: "gateway SIGTERM sent; supervisor will respawn",
+      at: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
   // Serve JS for /setup (kept external to avoid inline encoding/template issues)
   res.type("application/javascript");

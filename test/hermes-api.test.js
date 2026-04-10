@@ -24,6 +24,18 @@ test("server exposes /setup/api/logs/tail endpoint behind Hermes auth", () => {
   assert.match(src, /app\.get\("\/setup\/api\/logs\/tail", requireHermesAuth/);
 });
 
+test("server exposes /setup/api/doctor endpoint behind Hermes auth", () => {
+  assert.match(src, /app\.get\("\/setup\/api\/doctor", requireHermesAuth/);
+});
+
+test("server exposes /setup/api/conversations/stats endpoint behind Hermes auth", () => {
+  assert.match(src, /app\.get\("\/setup\/api\/conversations\/stats", requireHermesAuth/);
+});
+
+test("server exposes POST /setup/api/gateway/restart endpoint behind Hermes auth", () => {
+  assert.match(src, /app\.post\("\/setup\/api\/gateway\/restart", requireHermesAuth/);
+});
+
 test("requireHermesAuth accepts Bearer token and falls back to Basic", () => {
   assert.match(src, /function requireHermesAuth/);
   assert.match(src, /scheme === "Bearer"/);
