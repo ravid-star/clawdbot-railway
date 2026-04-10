@@ -235,13 +235,30 @@ and recover automatically when it isn't.
   escalate — something upstream is broken.
 ```
 
-Cron registration on the Hermes host:
+Cron registration on the Hermes host. In the Hermes CLI, `cron add`
+takes `<schedule> <prompt>` as positional arguments and accepts
+natural-language schedules like `"every 2m"` as well as standard cron
+expressions. The `--skill` flag attaches the supervisor skill so the
+agent has its playbook loaded on every run:
 
 ```bash
-hermes cron add \
+hermes cron add "every 2m" \
+  "Run the clawdbot-supervisor skill and report status briefly." \
   --name clawdbot-health \
-  --schedule "*/2 * * * *" \
-  --prompt "Run the clawdbot-supervisor skill and report status briefly."
+  --skill clawdbot-supervisor
+```
+
+Verify it registered:
+
+```bash
+hermes cron list
+```
+
+To pause or remove it later:
+
+```bash
+hermes cron pause <job_id>
+hermes cron remove <job_id>
 ```
 
 ---
