@@ -43,6 +43,19 @@ const WORKSPACE_DIR =
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+// Optional: separate bearer token for the Hermes supervision API surface.
+// When set, Hermes endpoints (/setup/api/metrics, /setup/api/logs/tail,
+// /setup/api/health) accept `Authorization: Bearer <HERMES_API_TOKEN>`
+// IN ADDITION to the existing SETUP_PASSWORD Basic auth. This lets an
+// external supervisor (e.g. Hermes Agent) run with a read-mostly token
+// that can be rotated independently of the human admin password.
+const HERMES_API_TOKEN = process.env.HERMES_API_TOKEN?.trim();
+
+// Optional: outbound webhook URL for crash notifications. POSTed with JSON
+// whenever the gateway subprocess exits (intentional or not). Used by
+// external supervisors to react to failures in real time instead of polling.
+const HERMES_WEBHOOK_URL = process.env.HERMES_WEBHOOK_URL?.trim();
+
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
@@ -143,6 +156,43 @@ let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
 
+// Lightweight metrics for external supervisors (e.g. Hermes Agent).
+// None of these contain secrets.
+const WRAPPER_STARTED_AT_MS = Date.now();
+let gatewayStartedAtMs = null;       // When the current gateway proc started (ms epoch)
+let gatewayStartCount = 0;            // How many times we've spawned the gateway
+let gatewayCrashCount = 0;            // Exits with non-zero code / non-SIGTERM signal
+let lastHealthyAtMs = null;           // Last time probeGateway() returned true
+
+async function fireHermesWebhook(event, payload) {
+  if (!HERMES_WEBHOOK_URL) return;
+  try {
+    const body = JSON.stringify({
+      event,
+      at: new Date().toISOString(),
+      wrapper: {
+        uptimeSec: Math.round((Date.now() - WRAPPER_STARTED_AT_MS) / 1000),
+        stateDir: STATE_DIR,
+      },
+      ...payload,
+    });
+    // Fire-and-forget with a short timeout so webhook failures never block
+    // gateway lifecycle.
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 5_000);
+    fetch(HERMES_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      signal: ctrl.signal,
+    })
+      .catch((err) => console.warn(`[hermes-webhook] ${event} failed: ${String(err)}`))
+      .finally(() => clearTimeout(t));
+  } catch (err) {
+    console.warn(`[hermes-webhook] serialize failed: ${String(err)}`);
+  }
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -200,18 +250,43 @@ async function startGateway() {
     },
   });
 
+  gatewayStartedAtMs = Date.now();
+  gatewayStartCount += 1;
+
   gatewayProc.on("error", (err) => {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
     gatewayProc = null;
+    gatewayStartedAtMs = null;
+    fireHermesWebhook("gateway.spawn_error", { error: msg });
   });
 
   gatewayProc.on("exit", (code, signal) => {
     const msg = `[gateway] exited code=${code} signal=${signal}`;
     console.error(msg);
-    lastGatewayExit = { code, signal, at: new Date().toISOString() };
+    const uptimeSec = gatewayStartedAtMs
+      ? Math.round((Date.now() - gatewayStartedAtMs) / 1000)
+      : null;
+    lastGatewayExit = { code, signal, at: new Date().toISOString(), uptimeSec };
     gatewayProc = null;
+    gatewayStartedAtMs = null;
+
+    // Count anything that is not a clean SIGTERM (wrapper-initiated stop/restart)
+    // as a crash for supervision purposes.
+    const isCrash = !(signal === "SIGTERM" && (code === 0 || code === null));
+    if (isCrash) {
+      gatewayCrashCount += 1;
+      fireHermesWebhook("gateway.crashed", {
+        code,
+        signal,
+        uptimeSec,
+        startCount: gatewayStartCount,
+        crashCount: gatewayCrashCount,
+      });
+    } else {
+      fireHermesWebhook("gateway.stopped", { code, signal, uptimeSec });
+    }
   });
 }
 
@@ -307,26 +382,30 @@ async function probeGateway() {
   // A simple TCP connect check is enough for "is it up".
   const net = await import("node:net");
 
-  return await new Promise((resolve) => {
+  const ok = await new Promise((resolve) => {
     const sock = net.createConnection({
       host: INTERNAL_GATEWAY_HOST,
       port: INTERNAL_GATEWAY_PORT,
       timeout: 750,
     });
 
-    const done = (ok) => {
+    const done = (result) => {
       try { sock.destroy(); } catch {}
-      resolve(ok);
+      resolve(result);
     };
 
     sock.on("connect", () => done(true));
     sock.on("timeout", () => done(false));
     sock.on("error", () => done(false));
   });
+
+  if (ok) lastHealthyAtMs = Date.now();
+  return ok;
 }
 
 // Public health endpoint (no auth) so Railway can probe without /setup.
-// Keep this free of secrets.
+// Keep this free of secrets. Extra fields (uptime, counters, last-healthy)
+// are safe to expose and are consumed by external supervisors like Hermes.
 app.get("/healthz", async (_req, res) => {
   let gatewayReachable = false;
   if (isConfigured()) {
@@ -337,21 +416,170 @@ app.get("/healthz", async (_req, res) => {
     }
   }
 
+  const now = Date.now();
+  const wrapperUptimeSec = Math.round((now - WRAPPER_STARTED_AT_MS) / 1000);
+  const gatewayUptimeSec = gatewayStartedAtMs
+    ? Math.round((now - gatewayStartedAtMs) / 1000)
+    : null;
+  const secondsSinceHealthy = lastHealthyAtMs
+    ? Math.round((now - lastHealthyAtMs) / 1000)
+    : null;
+
   res.json({
     ok: true,
     wrapper: {
       configured: isConfigured(),
       stateDir: STATE_DIR,
       workspaceDir: WORKSPACE_DIR,
+      uptimeSec: wrapperUptimeSec,
+      startedAt: new Date(WRAPPER_STARTED_AT_MS).toISOString(),
     },
     gateway: {
       target: GATEWAY_TARGET,
       reachable: gatewayReachable,
+      running: Boolean(gatewayProc),
+      pid: gatewayProc?.pid ?? null,
+      uptimeSec: gatewayUptimeSec,
+      startCount: gatewayStartCount,
+      crashCount: gatewayCrashCount,
+      lastHealthyAt: lastHealthyAtMs ? new Date(lastHealthyAtMs).toISOString() : null,
+      secondsSinceHealthy,
       lastError: lastGatewayError,
       lastExit: lastGatewayExit,
       lastDoctorAt,
     },
   });
+});
+
+// --- Hermes supervision API ---
+// Middleware that accepts EITHER SETUP_PASSWORD Basic auth (for humans) OR
+// a Bearer token equal to HERMES_API_TOKEN (for machine supervisors).
+// If HERMES_API_TOKEN is not set, this falls back to SETUP_PASSWORD only,
+// so behavior for existing deployments is unchanged.
+function requireHermesAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+
+  // Accept Bearer token match.
+  if (HERMES_API_TOKEN && scheme === "Bearer" && encoded) {
+    // Constant-time-ish compare via length + char check.
+    if (encoded === HERMES_API_TOKEN) return next();
+  }
+
+  // Fall back to Basic auth against SETUP_PASSWORD.
+  if (!SETUP_PASSWORD) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send(
+        "Neither HERMES_API_TOKEN nor SETUP_PASSWORD is set. Configure at least one in Railway Variables.",
+      );
+  }
+
+  if (scheme === "Basic" && encoded) {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+    if (password === SETUP_PASSWORD) return next();
+  }
+
+  res.set("WWW-Authenticate", 'Basic realm="OpenClaw Hermes API", Bearer');
+  return res.status(401).json({ ok: false, error: "Auth required" });
+}
+
+// Detailed health endpoint (same data as /healthz plus process metrics).
+app.get("/setup/api/health", requireHermesAuth, async (_req, res) => {
+  let gatewayReachable = false;
+  if (isConfigured()) {
+    try { gatewayReachable = await probeGateway(); } catch {}
+  }
+
+  const mem = process.memoryUsage();
+  res.json({
+    ok: true,
+    wrapper: {
+      configured: isConfigured(),
+      uptimeSec: Math.round((Date.now() - WRAPPER_STARTED_AT_MS) / 1000),
+      node: process.version,
+      memory: {
+        rssMB: Math.round(mem.rss / 1024 / 1024),
+        heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+        heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+        externalMB: Math.round(mem.external / 1024 / 1024),
+      },
+    },
+    gateway: {
+      reachable: gatewayReachable,
+      running: Boolean(gatewayProc),
+      pid: gatewayProc?.pid ?? null,
+      uptimeSec: gatewayStartedAtMs
+        ? Math.round((Date.now() - gatewayStartedAtMs) / 1000)
+        : null,
+      startCount: gatewayStartCount,
+      crashCount: gatewayCrashCount,
+      lastHealthyAt: lastHealthyAtMs ? new Date(lastHealthyAtMs).toISOString() : null,
+      lastError: lastGatewayError,
+      lastExit: lastGatewayExit,
+    },
+  });
+});
+
+// Structured metrics for scraping / dashboards.
+// JSON-native (not Prometheus) because Hermes already speaks JSON via MCP.
+app.get("/setup/api/metrics", requireHermesAuth, (_req, res) => {
+  const mem = process.memoryUsage();
+  const cpu = process.cpuUsage();
+  res.json({
+    at: new Date().toISOString(),
+    wrapper: {
+      uptimeSec: Math.round((Date.now() - WRAPPER_STARTED_AT_MS) / 1000),
+      memoryRssBytes: mem.rss,
+      heapUsedBytes: mem.heapUsed,
+      cpuUserMicros: cpu.user,
+      cpuSystemMicros: cpu.system,
+    },
+    gateway: {
+      running: Boolean(gatewayProc),
+      uptimeSec: gatewayStartedAtMs
+        ? Math.round((Date.now() - gatewayStartedAtMs) / 1000)
+        : 0,
+      startCount: gatewayStartCount,
+      crashCount: gatewayCrashCount,
+      lastHealthyAtMs: lastHealthyAtMs || 0,
+      secondsSinceHealthy: lastHealthyAtMs
+        ? Math.round((Date.now() - lastHealthyAtMs) / 1000)
+        : null,
+    },
+  });
+});
+
+// Structured log tail: wraps `openclaw logs --tail N` and returns
+// already-redacted text plus a parsed line array. Level filter is
+// best-effort (grep on common prefixes) so Hermes can focus on errors.
+app.get("/setup/api/logs/tail", requireHermesAuth, async (req, res) => {
+  const n = Math.max(50, Math.min(2000, Number.parseInt(String(req.query.n || "200"), 10) || 200));
+  const level = String(req.query.level || "").toLowerCase();
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["logs", "--tail", String(n)]));
+    const raw = redactSecrets(r.output || "");
+    let lines = raw.split(/\r?\n/);
+
+    if (level === "error") {
+      lines = lines.filter((l) => /\b(error|fatal|panic|ERR|FATAL)\b/i.test(l));
+    } else if (level === "warn") {
+      lines = lines.filter((l) => /\b(warn|warning|WARN)\b/i.test(l));
+    }
+
+    res.status(r.code === 0 ? 200 : 500).json({
+      ok: r.code === 0,
+      requested: n,
+      returned: lines.length,
+      level: level || "all",
+      lines,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
 });
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {

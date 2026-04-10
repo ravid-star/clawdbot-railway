@@ -9,6 +9,7 @@ This repo packages **OpenClaw** for Railway with a small **/setup** web wizard s
 - Persistent state via **Railway Volume** (so config/credentials/memory survive redeploys)
 - One-click **Export backup** (so users can migrate off Railway later)
 - **Import backup** from `/setup` (advanced recovery)
+- **Hermes supervision API** — optional bearer-token endpoints (`/setup/api/health`, `/setup/api/metrics`, `/setup/api/logs/tail`) plus an outbound crash webhook, so an external agent can monitor and auto-heal the deployment. See [README-HERMES.md](./README-HERMES.md).
 
 ## How it works (high level)
 
