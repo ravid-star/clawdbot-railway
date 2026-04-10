@@ -241,14 +241,30 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
+  // Raise the gateway child process's V8 old-space heap limit. Node defaults to
+  // a conservative ~500 MB which crashes OpenClaw's gateway with
+  // "Reached heap limit Allocation failed" on Railway Hobby (1 GB container).
+  // GATEWAY_MAX_OLD_SPACE_MB (default 768) leaves ~200-250 MB headroom for the
+  // wrapper + native/C++ overhead so we stay safely under 1 GB.
+  const gatewayMaxOldSpaceMb = Number.parseInt(
+    process.env.GATEWAY_MAX_OLD_SPACE_MB ?? "768",
+    10,
+  );
+  const existingNodeOpts = process.env.NODE_OPTIONS || "";
+  const gatewayNodeOptions = /max-old-space-size/.test(existingNodeOpts)
+    ? existingNodeOpts
+    : `${existingNodeOpts} --max-old-space-size=${gatewayMaxOldSpaceMb}`.trim();
+
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
       OPENCLAW_STATE_DIR: STATE_DIR,
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      NODE_OPTIONS: gatewayNodeOptions,
     },
   });
+  console.log(`[wrapper] gateway NODE_OPTIONS: ${gatewayNodeOptions}`);
 
   gatewayStartedAtMs = Date.now();
   gatewayStartCount += 1;
@@ -932,11 +948,15 @@ function runCmd(cmd, args, opts = {}) {
 }
 
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
+  // NOTE: declared at function scope (not inside try) so the catch block below
+  // can still safely respond when an earlier await throws. Previously this was
+  // declared inside try and any throw would trigger a secondary
+  // "ReferenceError: respondJson is not defined" in catch, masking the real error.
+  const respondJson = (status, body) => {
+    if (res.writableEnded || res.headersSent) return;
+    res.status(status).json(body);
+  };
   try {
-    const respondJson = (status, body) => {
-      if (res.writableEnded || res.headersSent) return;
-      res.status(status).json(body);
-    };
     if (isConfigured()) {
       await ensureGatewayRunning();
       return respondJson(200, {
